@@ -20,7 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"regexp"
 	"testing"
 	"time"
 
@@ -35,13 +35,14 @@ import (
 )
 
 func NewGlobalEnvironment(ctx context.Context) GlobalEnvironment {
-	fmt.Printf("level %s, state %s\n\n", l, s)
+	fmt.Printf("level %s, state %s, feature %s\n\n", l, s, *f)
 
 	return &MagicGlobalEnvironment{
 		c:                ctx,
 		instanceID:       uuid.New().String(),
 		RequirementLevel: *l,
 		FeatureState:     *s,
+		FeatureMatch:     regexp.MustCompile(*f),
 	}
 }
 
@@ -53,12 +54,14 @@ type MagicGlobalEnvironment struct {
 
 	RequirementLevel feature.Levels
 	FeatureState     feature.States
+	FeatureMatch     *regexp.Regexp
 }
 
 type MagicEnvironment struct {
-	c context.Context
-	l feature.Levels
-	s feature.States
+	c            context.Context
+	l            feature.Levels
+	s            feature.States
+	featureMatch *regexp.Regexp
 
 	images           map[string]string
 	namespace        string
@@ -111,12 +114,14 @@ func (mr *MagicGlobalEnvironment) Environment(opts ...EnvOpts) (context.Context,
 		panic(err)
 	}
 
-	namespace := feature.MakeK8sNamePrefix(feature.AppendRandomString("rekt"))
+	namespace := feature.MakeK8sNamePrefix(feature.AppendRandomString("test"))
 
 	env := &MagicEnvironment{
-		c:         mr.c,
-		l:         mr.RequirementLevel,
-		s:         mr.FeatureState,
+		c:            mr.c,
+		l:            mr.RequirementLevel,
+		s:            mr.FeatureState,
+		featureMatch: mr.FeatureMatch,
+
 		images:    images,
 		namespace: namespace,
 	}
@@ -212,21 +217,27 @@ func (mr *MagicEnvironment) Prerequisite(ctx context.Context, t *testing.T, f *f
 func (mr *MagicEnvironment) Test(ctx context.Context, originalT *testing.T, f *feature.Feature) {
 	originalT.Helper() // Helper marks the calling function as a test helper function.
 
+	if !mr.featureMatch.MatchString(f.Name) {
+		originalT.Logf("Skipping feature '%s' assertions because --feature=%s  doesn't match", f.Name, mr.featureMatch.String())
+		return
+	}
+
 	mr.milestones.TestStarted(f.Name, originalT)
-	originalT.Cleanup(func() {
-		mr.milestones.TestFinished(f.Name, originalT)
-	})
+	defer mr.milestones.TestFinished(f.Name, originalT)
 
 	if f.State == nil {
 		f.State = &state.KVStore{}
 	}
 	ctx = state.ContextWith(ctx, f.State)
+	ctx = feature.ContextWith(ctx, f)
 
 	steps := categorizeSteps(f.Steps)
 
 	skipAssertions := false
 	skipRequirements := false
 	skipReason := ""
+
+	mr.milestones.StepsPlanned(f.Name, steps, originalT)
 
 	for _, s := range steps[feature.Setup] {
 		s := s
@@ -238,6 +249,7 @@ func (mr *MagicEnvironment) Test(ctx context.Context, originalT *testing.T, f *f
 		if internalT.Failed() {
 			skipAssertions = true
 			skipRequirements = true // No need to test other requirements
+			break                   // No need to continue the setup
 		}
 	}
 
@@ -248,13 +260,11 @@ func (mr *MagicEnvironment) Test(ctx context.Context, originalT *testing.T, f *f
 			break
 		}
 
-		// Requirement never fails the parent test
-		internalT := mr.executeWithSkippingT(ctx, originalT, f, &s)
+		internalT := mr.executeWithoutWrappingT(ctx, originalT, f, &s)
 
 		if internalT.Failed() {
 			skipAssertions = true
 			skipRequirements = true // No need to test other requirements
-			skipReason = fmt.Sprintf("requirement %q failed", s.Name)
 		}
 	}
 
@@ -277,9 +287,6 @@ func (mr *MagicEnvironment) Test(ctx context.Context, originalT *testing.T, f *f
 	for _, s := range steps[feature.Teardown] {
 		s := s
 
-		wg := &sync.WaitGroup{}
-		wg.Add(1)
-
 		// Teardown are executed always, no matter their level and state
 		mr.executeWithoutWrappingT(ctx, originalT, f, &s)
 	}
@@ -289,6 +296,7 @@ func (mr *MagicEnvironment) Test(ctx context.Context, originalT *testing.T, f *f
 	}
 }
 
+// TODO: this logic is strange and hard to follow.
 func (mr *MagicEnvironment) shouldFail(s *feature.Step) bool {
 	return !(mr.s&s.S == 0 || mr.l&s.L == 0)
 }
@@ -298,21 +306,13 @@ func (mr *MagicEnvironment) TestSet(ctx context.Context, t *testing.T, fs *featu
 	t.Helper() // Helper marks the calling function as a test helper function
 
 	mr.milestones.TestSetStarted(fs.Name, t)
-	t.Cleanup(func() {
-		mr.milestones.TestSetFinished(fs.Name, t)
-	})
+	defer mr.milestones.TestSetFinished(fs.Name, t)
 
-	wg := &sync.WaitGroup{}
 	for _, f := range fs.Features {
-		wg.Add(1)
-		t.Run(fs.Name, func(t *testing.T) {
-			t.Cleanup(wg.Done)
-			// FeatureSets should be run in parallel.
-			mr.Test(ctx, t, &f)
-		})
+		// Make sure the name is appended
+		f.Name = fs.Name + "/" + f.Name
+		mr.Test(ctx, t, &f)
 	}
-
-	wg.Wait()
 }
 
 type envKey struct{}
